@@ -9,8 +9,9 @@ env/
 # Logs
 *.log
 
-# IDE
+# IDE / tools
 .cursor/
+.claude/
 .vscode/
 .idea/
 
