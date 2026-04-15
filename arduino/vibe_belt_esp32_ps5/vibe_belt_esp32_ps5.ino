@@ -38,17 +38,17 @@ const uint8_t NUM_MOTORS = 14;
 
 // Column groups for left-right waves
 const uint8_t COL_COUNT = 5;
-const uint8_t COL_SIZES[] = {3, 3, 1, 3, 4};
-// col 0: 075,076,077
+const uint8_t COL_SIZES[] = {3, 3, 2, 3, 3};
+// col 0: 075,076,077  (motors 0,4,9)
 const Motor COL0[] = {{MUX_A,5},{MUX_A,6},{MUX_A,7}};
-// col 1: 071,072,073
+// col 1: 071,072,073  (motors 1,5,10)
 const Motor COL1[] = {{MUX_A,1},{MUX_A,2},{MUX_A,3}};
-// col 2: 070
-const Motor COL2[] = {{MUX_A,0}};
-// col 3: 173,174,176
-const Motor COL3[] = {{MUX_B,3},{MUX_B,4},{MUX_B,6}};
-// col 4: 172,171,175,170
-const Motor COL4[] = {{MUX_B,2},{MUX_B,1},{MUX_B,5},{MUX_B,0}};
+// col 2: 070,176      (motors 6,11 — gap at top)
+const Motor COL2[] = {{MUX_A,0},{MUX_B,6}};
+// col 3: 173,174,175  (motors 2,7,12)
+const Motor COL3[] = {{MUX_B,3},{MUX_B,4},{MUX_B,5}};
+// col 4: 172,171,170  (motors 3,8,13)
+const Motor COL4[] = {{MUX_B,2},{MUX_B,1},{MUX_B,0}};
 
 const Motor* COLS[] = {COL0, COL1, COL2, COL3, COL4};
 
@@ -96,11 +96,24 @@ bool initDrvOnChannel() {
   return true;
 }
 
+// ---- Motor state tracking for visualization ----
+uint8_t motorState[14] = {0};
+unsigned long lastBroadcast = 0;
+const unsigned long BROADCAST_MS = 50;  // send state every 50ms
+
 // Set RTP value (0-127) on one motor
 void setMotorRTP(const Motor &m, uint8_t rtp) {
   muxSelect(m.mux, m.ch);
   initDrvOnChannel();
   drv.setRealtimeValue(rtp);
+
+  // track state: find index of this motor in ALL_MOTORS
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+    if (ALL_MOTORS[i].mux == m.mux && ALL_MOTORS[i].ch == m.ch) {
+      motorState[i] = rtp;
+      break;
+    }
+  }
 }
 
 // Set RTP on a group of motors
@@ -108,6 +121,30 @@ void setGroupRTP(const Motor* group, uint8_t count, uint8_t rtp) {
   for (uint8_t i = 0; i < count; i++) {
     setMotorRTP(group[i], rtp);
   }
+}
+
+// Broadcast motor state over serial: "V 100,0,50,0,..."
+void broadcastState() {
+  unsigned long now = millis();
+  if (now - lastBroadcast < BROADCAST_MS) return;
+  lastBroadcast = now;
+
+  // always send current state (including all-zeros once after activity)
+  static bool wasActive = false;
+  bool anyOn = false;
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+    if (motorState[i] > 0) { anyOn = true; break; }
+  }
+
+  if (!anyOn && !wasActive) return;  // idle, nothing to send
+  wasActive = anyOn;
+
+  Serial.print("V ");
+  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
+    if (i > 0) Serial.print(',');
+    Serial.print(motorState[i]);
+  }
+  Serial.println();
 }
 
 // Stop all motors
@@ -169,9 +206,8 @@ void renderWave() {
   for (uint8_t g = 0; g < wave.groupCount; g++) {
     float dist = fabs((float)g - wave.pos);
     uint8_t rtp = 0;
-    if (dist < 1.5) {
-      // sine fade: cos(dist * PI / 1.5) mapped to 0..RTP_MAX
-      float fade = cos(dist * PI / 1.5);
+    if (dist < 2.5) {
+      float fade = cos(dist * PI / 2.5);
       if (fade < 0) fade = 0;
       rtp = (uint8_t)(fade * 100);
     }
@@ -303,11 +339,13 @@ void processRightStick(int16_t rx, int16_t ry) {
   float pos = ((float)(constrain(rx, -512, 512) + 512) / 1024.0) * (COL_COUNT - 1);
 
   // Sine-fade across columns based on distance from pos
+  // Radius 2.5 → adjacent column gets ~31% when centered, smooth crossfade
+  const float FADE_R = 2.5;
   for (uint8_t g = 0; g < COL_COUNT; g++) {
     float dist = fabs((float)g - pos);
     uint8_t rtp = 0;
-    if (dist < 1.2) {
-      float fade = cos(dist * PI / 1.2);
+    if (dist < FADE_R) {
+      float fade = cos(dist * PI / FADE_R);
       if (fade < 0) fade = 0;
       rtp = (uint8_t)(fade * maxRtp);
     }
@@ -549,10 +587,87 @@ void setup() {
   Serial.println("Ready. Put PS5 controller in pairing mode (PS + Create).");
 }
 
+// -------------------- Serial command handler --------------------
+const unsigned long SERIAL_AUTO_OFF_MS = 200;  // auto-stop if no serial cmd within 200ms
+unsigned long lastSerialCmd = 0;
+bool serialMotorActive = false;
+
+void handleSerial(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  lastSerialCmd = millis();
+
+  if (line.equalsIgnoreCase("PING")) {
+    Serial.println("PONG");
+    return;
+  }
+
+  if (line.equalsIgnoreCase("STOP") || line.equalsIgnoreCase("ALLOFF")) {
+    stopAll();
+    serialMotorActive = false;
+    Serial.println("OK");
+    return;
+  }
+
+  // HIT <idx> [rtp]  — default rtp=100
+  if (line.startsWith("HIT ") || line.startsWith("hit ")) {
+    String args = line.substring(4);
+    args.trim();
+    int sp = args.indexOf(' ');
+    int idx;
+    uint8_t rtp = 100;
+    if (sp > 0) {
+      idx = args.substring(0, sp).toInt();
+      rtp = constrain(args.substring(sp + 1).toInt(), 0, 127);
+    } else {
+      idx = args.toInt();
+    }
+    if (idx < 0 || idx >= NUM_MOTORS) { Serial.println("ERR"); return; }
+    setMotorRTP(ALL_MOTORS[idx], rtp);
+    serialMotorActive = true;
+    Serial.print("OK "); Serial.println(idx);
+    return;
+  }
+
+  // RTP <idx> <value>
+  if (line.startsWith("RTP ") || line.startsWith("rtp ")) {
+    String args = line.substring(4);
+    args.trim();
+    int sp = args.indexOf(' ');
+    if (sp <= 0) { Serial.println("ERR"); return; }
+    int idx = args.substring(0, sp).toInt();
+    int val = args.substring(sp + 1).toInt();
+    if (idx < 0 || idx >= NUM_MOTORS) { Serial.println("ERR"); return; }
+    setMotorRTP(ALL_MOTORS[idx], constrain(val, 0, 127));
+    if (val > 0) serialMotorActive = true;
+    Serial.print("OK "); Serial.println(idx);
+    return;
+  }
+
+  Serial.print("ERR "); Serial.println(line);
+}
+
 void loop() {
+  // Serial commands (touch pad, etc.)
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    handleSerial(line);
+  }
+
+  // Safety: auto-stop serial motors if no command received for 200ms
+  if (serialMotorActive && (millis() - lastSerialCmd >= SERIAL_AUTO_OFF_MS)) {
+    stopAll();
+    serialMotorActive = false;
+  }
+
+  // Bluetooth PS5 controller — skip if serial touch pad is active
   bool ok = BP32.update();
-  if (ok) {
+  if (ok && !serialMotorActive) {
     processController();
   }
+  // broadcast motor state for HTML visualization
+  broadcastState();
+
   delay(1);  // minimal yield for watchdog
 }

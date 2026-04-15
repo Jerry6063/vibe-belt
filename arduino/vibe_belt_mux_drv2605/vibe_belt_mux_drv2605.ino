@@ -1,226 +1,166 @@
+/*
+ *  Vibe Belt — Leonardo / Pro Micro + 2×PCA9548A + 14×DRV2605
+ *  Serial controlled, RTP mode (real-time proportional intensity)
+ *
+ *  Motor layout matches ESP32 version:
+ *    075  071  ---  173  172    row 0  (idx 0-3, gap at col 2)
+ *    076  072  070  174  171    row 1  (idx 4-8)
+ *    077  073  176  175  170    row 2  (idx 9-13)
+ *
+ *  Protocol (115200 baud, line-based):
+ *    PING                  → PONG
+ *    STOP                  → OK
+ *    HIT <0-13> [rtp]      → OK <idx>         single motor, optional intensity 0-127
+ *    MULTI <bitmask> [rtp] → OK                fire multiple motors at once
+ *    RTP <idx> <0-127>     → OK                set one motor to sustained RTP level
+ *    ALLOFF                → OK                zero all motors
+ */
+
 #include <Wire.h>
 #include <Adafruit_DRV2605.h>
 
 Adafruit_DRV2605 drv;
 
-// Two PCA9548A muxes
-#define MUX_A 0x70
-#define MUX_B 0x71
+/* ═══ Hardware ═══ */
+#define MUX_A  0x70
+#define MUX_B  0x71
 
-// Use 14 motors: 0x70 CH0..CH6 (7), 0x71 CH0..CH6 (7)
-#define MOTORS_PER_MUX 7
-#define NUM_MOTORS 14
+struct Motor {
+  uint8_t mux;
+  uint8_t ch;
+};
 
-// ---------- Timing ----------
-const unsigned long FLOW_TICK_MS = 120;      // cursor flow speed (z)
-const unsigned long WAVE_STEP_MS = 90;       // wave speed (w/a/d)
-const unsigned long LONG_VIBE_MS = 900;      // for 's' long vibration (per motor)
+// Physical layout — order matches grid (row-major, skip gap)
+static const Motor MOTORS[] = {
+  {MUX_A, 5}, {MUX_A, 1},                {MUX_B, 3}, {MUX_B, 2},  // row 0 (4 motors)
+  {MUX_A, 6}, {MUX_A, 2}, {MUX_A, 0},   {MUX_B, 4}, {MUX_B, 1},  // row 1 (5 motors)
+  {MUX_A, 7}, {MUX_A, 3}, {MUX_B, 6},   {MUX_B, 5}, {MUX_B, 0},  // row 2 (5 motors)
+};
+static const uint8_t N = 14;
 
-// ---------- Effects ----------
-const uint8_t EFFECT_STRONG = 1;   // strong click
-const uint8_t EFFECT_WEAK   = 3;   // weaker click
-const uint8_t EFFECT_LONG   = 118; // "Long buzz for programmatic stopping" (library effect)
+// Grid position for each motor index (row, col) — for reference
+// idx:  0     1     2     3     4     5     6     7     8     9    10    11    12    13
+// pos: 0,0  0,1  0,3  0,4  1,0  1,1  1,2  1,3  1,4  2,0  2,1  2,2  2,3  2,4
 
-// ---------- Flow state ----------
-bool flowing = false;
-int8_t flowDir = +1;               // only forward for now
-unsigned long lastTick = 0;
-uint8_t style = 1;                 // 0=single point, 1=point+trail
-int cursor = 0;
+/* ═══ Low-level ═══ */
 
-// ---------- Wave orders (EDIT THESE TO MATCH YOUR HEX LAYOUT) ----------
-// Default: treat motor index 0..13 as a 1D path.
-// W bottom->top, A right->left use reverse, D left->right use forward.
-const uint8_t WAVE_LEFT_TO_RIGHT[NUM_MOTORS] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
-const uint8_t WAVE_RIGHT_TO_LEFT[NUM_MOTORS] = { 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
-const uint8_t WAVE_BOTTOM_TO_TOP[NUM_MOTORS] = { 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
-
-// ---------- MUX helpers ----------
-void muxSelect(uint8_t muxAddr, uint8_t ch) {
-  Wire.beginTransmission(muxAddr);
+static void muxSelect(uint8_t addr, uint8_t ch) {
+  Wire.beginTransmission(addr);
   Wire.write(1 << ch);
   Wire.endTransmission();
-  delay(2);
 }
 
-// Map motor index (0..13) -> (muxAddr, muxCh)
-void motorMap(uint8_t idx, uint8_t &muxAddr, uint8_t &muxCh) {
-  if (idx < MOTORS_PER_MUX) {
-    muxAddr = MUX_A;
-    muxCh = idx;                  // 0..6
-  } else {
-    muxAddr = MUX_B;
-    muxCh = idx - MOTORS_PER_MUX; // 0..6
-  }
-}
-
-// Init DRV on currently selected mux channel
-bool initDRV() {
-  bool ok = drv.begin();
-  if (!ok) return false;
-  drv.selectLibrary(1);
+static bool drvInit() {
+  if (!drv.begin()) return false;
+  drv.setMode(DRV2605_MODE_REALTIME);
   drv.useERM();
-  drv.setMode(DRV2605_MODE_INTTRIG);
   return true;
 }
 
-void playEffect(uint8_t effect) {
-  drv.setWaveform(0, effect);
-  drv.setWaveform(1, 0);
-  drv.go();
+static bool setMotorRTP(uint8_t idx, uint8_t rtp) {
+  if (idx >= N) return false;
+  muxSelect(MOTORS[idx].mux, MOTORS[idx].ch);
+  if (!drvInit()) return false;
+  drv.setRealtimeValue(rtp);
+  return true;
 }
 
-void stopEffectNow() {
-  drv.setWaveform(0, 0);
-  drv.setWaveform(1, 0);
-  drv.go();
+static void allOff() {
+  for (uint8_t i = 0; i < N; i++) {
+    setMotorRTP(i, 0);
+  }
 }
 
-// Vibrate one motor by index
-void vibrateMotor(uint8_t idx, uint8_t effect) {
-  uint8_t muxAddr, muxCh;
-  motorMap(idx, muxAddr, muxCh);
-  muxSelect(muxAddr, muxCh);
-  if (!initDRV()) {
-    Serial.print("Motor "); Serial.print(idx);
-    Serial.println(" FAIL (DRV not found)");
+/* ═══ Command handler ═══ */
+
+static void handleCmd(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  // PING
+  if (line.equalsIgnoreCase("PING")) {
+    Serial.println("PONG");
     return;
   }
-  playEffect(effect);
-}
 
-// Advance cursor along ring path
-int advanceCursor(int c, int step) {
-  int n = (c + step) % NUM_MOTORS;
-  if (n < 0) n += NUM_MOTORS;
-  return n;
-}
-
-// One tick of flow motion
-void stepOnce(int stepDir) {
-  int prev = cursor;
-  cursor = advanceCursor(cursor, stepDir);
-
-  vibrateMotor(cursor, EFFECT_STRONG);
-
-  if (style == 1) {
-    delay(50);
-    vibrateMotor(prev, EFFECT_WEAK);
+  // STOP / ALLOFF
+  if (line.equalsIgnoreCase("STOP") || line.equalsIgnoreCase("ALLOFF")) {
+    allOff();
+    Serial.println("OK");
+    return;
   }
 
-  Serial.print("Cursor -> ");
-  Serial.println(cursor);
-}
-
-// Generic wave runner
-void runWave(const uint8_t *order, uint8_t len, uint8_t repeats) {
-  for (uint8_t r = 0; r < repeats; r++) {
-    for (uint8_t i = 0; i < len; i++) {
-      vibrateMotor(order[i], EFFECT_STRONG);
-      delay(WAVE_STEP_MS);
+  // HIT <idx> [rtp]   — default rtp=100
+  if (line.startsWith("HIT ") || line.startsWith("hit ")) {
+    String args = line.substring(4);
+    args.trim();
+    int sp = args.indexOf(' ');
+    int idx;
+    uint8_t rtp = 100;
+    if (sp > 0) {
+      idx = args.substring(0, sp).toInt();
+      rtp = constrain(args.substring(sp + 1).toInt(), 0, 127);
+    } else {
+      idx = args.toInt();
     }
+    if (idx < 0 || idx >= N) { Serial.println("ERR"); return; }
+    setMotorRTP(idx, rtp);
+    Serial.print("OK "); Serial.println(idx);
+    return;
   }
+
+  // RTP <idx> <value>
+  if (line.startsWith("RTP ") || line.startsWith("rtp ")) {
+    String args = line.substring(4);
+    args.trim();
+    int sp = args.indexOf(' ');
+    if (sp <= 0) { Serial.println("ERR"); return; }
+    int idx = args.substring(0, sp).toInt();
+    int val = args.substring(sp + 1).toInt();
+    if (idx < 0 || idx >= N) { Serial.println("ERR"); return; }
+    setMotorRTP(idx, constrain(val, 0, 127));
+    Serial.print("OK "); Serial.println(idx);
+    return;
+  }
+
+  // MULTI <bitmask> [rtp]  — bitmask is 14-bit, each bit = one motor
+  if (line.startsWith("MULTI ") || line.startsWith("multi ")) {
+    String args = line.substring(6);
+    args.trim();
+    int sp = args.indexOf(' ');
+    uint16_t mask;
+    uint8_t rtp = 100;
+    if (sp > 0) {
+      mask = (uint16_t)strtoul(args.substring(0, sp).c_str(), NULL, 10);
+      rtp  = constrain(args.substring(sp + 1).toInt(), 0, 127);
+    } else {
+      mask = (uint16_t)strtoul(args.c_str(), NULL, 10);
+    }
+    for (uint8_t i = 0; i < N; i++) {
+      if (mask & (1 << i)) {
+        setMotorRTP(i, rtp);
+      }
+    }
+    Serial.println("OK");
+    return;
+  }
+
+  Serial.print("ERR "); Serial.println(line);
 }
 
-// 's' action: long vibration once (sequential; can't truly do all at the same instant)
-void longVibeAllOnce() {
-  Serial.println("S: long vibrate all motors once");
-  for (uint8_t i = 0; i < NUM_MOTORS; i++) {
-    vibrateMotor(i, EFFECT_LONG);
-    delay(LONG_VIBE_MS);
-    stopEffectNow();
-    delay(40);
-  }
-}
-
-void printHelp() {
-  Serial.println("\n=== Controls ===");
-  Serial.println("z : start FLOW forward (cursor moves)");
-  Serial.println("x : stop FLOW");
-  Serial.println("0..13 : jump cursor to that motor index (pulse)");
-  Serial.println("w : bottom->top wave x2");
-  Serial.println("a : right->left wave x1");
-  Serial.println("d : left->right wave x1");
-  Serial.println("s : long vibrate all motors once");
-  Serial.println("m : toggle flow style (0=point,1=point+trail)");
-  Serial.println("================\n");
-}
+/* ═══ Arduino entry ═══ */
 
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
   Wire.begin();
-  printHelp();
-
-  // quick roll call (optional)
-  for (int i = 0; i < NUM_MOTORS; i++) {
-    vibrateMotor(i, EFFECT_WEAK);
-    delay(50);
-  }
+  delay(500);
+  Serial.println("READY");
 }
 
 void loop() {
-  // serial input
   if (Serial.available()) {
     String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) {
-      char c = line[0];
-
-      if (c == 'z' || c == 'Z') {
-        flowing = true;
-        flowDir = +1;
-        Serial.println("FLOW forward (z)");
-      }
-      else if (c == 'x' || c == 'X') {
-        flowing = false;
-        Serial.println("FLOW stop (x)");
-      }
-      else if (c == 'w' || c == 'W') {
-        flowing = false;
-        Serial.println("W: bottom->top wave x2");
-        runWave(WAVE_BOTTOM_TO_TOP, NUM_MOTORS, 2);
-      }
-      else if (c == 'a' || c == 'A') {
-        flowing = false;
-        Serial.println("A: right->left wave");
-        runWave(WAVE_RIGHT_TO_LEFT, NUM_MOTORS, 1);
-      }
-      else if (c == 'd' || c == 'D') {
-        flowing = false;
-        Serial.println("D: left->right wave");
-        runWave(WAVE_LEFT_TO_RIGHT, NUM_MOTORS, 1);
-      }
-      else if (c == 's' || c == 'S') {
-        flowing = false;
-        longVibeAllOnce();
-      }
-      else if (c == 'm' || c == 'M') {
-        style = (style == 0) ? 1 : 0;
-        Serial.print("Style = "); Serial.println(style);
-      }
-      else {
-        // number 0..13 => jump cursor
-        int v = line.toInt();
-        if (v >= 0 && v < NUM_MOTORS) {
-          flowing = false;
-          cursor = v;
-          Serial.print("Cursor set to "); Serial.println(cursor);
-          vibrateMotor(cursor, EFFECT_STRONG);
-        } else {
-          printHelp();
-        }
-      }
-    }
-  }
-
-  // flow tick (non-blocking)
-  if (flowing) {
-    unsigned long now = millis();
-    if (now - lastTick >= FLOW_TICK_MS) {
-      lastTick = now;
-      stepOnce(flowDir);
-    }
+    handleCmd(line);
   }
 }
-

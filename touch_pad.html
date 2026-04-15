@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Vibe Belt — Touch Pad</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden;
+    background: #111; color: #eee;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+
+  /* ── top bar ── */
+  .bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px; background: #1a1a2e; height: 48px;
+  }
+  .bar button {
+    padding: 6px 16px; border: none; border-radius: 6px;
+    background: #0f3460; color: #eee; font-size: 14px; cursor: pointer;
+  }
+  .bar button:active { background: #e94560; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  .dot.on { background: #0f0; }
+  .log { flex: 1; font-size: 12px; color: #777; text-align: right; overflow: hidden; white-space: nowrap; }
+
+  /* ── grid ── */
+  .grid-wrap {
+    display: flex; align-items: center; justify-content: center;
+    height: calc(100% - 48px); padding: 16px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    gap: 8px;
+    width: min(92vw, 480px);
+    aspect-ratio: 5 / 3;
+    touch-action: none;
+  }
+  .cell {
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    font-size: 13px; font-weight: 600;
+    background: #1e3a5f; color: #5a9fd4;
+    user-select: none; -webkit-user-select: none;
+    transition: background 0.35s ease, box-shadow 0.35s ease, color 0.35s ease;
+  }
+  .cell.empty {
+    background: transparent; color: transparent;
+    pointer-events: none;
+  }
+  .cell.active {
+    background: #e94560; color: #fff;
+    box-shadow: 0 0 24px 4px rgba(233, 69, 96, 0.6);
+    transition: none;
+  }
+  .cell.vis {
+    color: #fff;
+    transition: background 0.06s, box-shadow 0.06s;
+  }
+
+  /* motor label sub-line */
+  .cell .hw { display: block; font-size: 9px; color: #3a6a9a; margin-top: 1px; }
+  .cell.active .hw, .cell.vis .hw { color: rgba(255,255,255,0.6); }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <button id="btnConnect">连接串口</button>
+  <div class="dot" id="dot"></div>
+  <div class="log" id="log">未连接 — 需要 Chrome / Edge</div>
+</div>
+
+<div class="grid-wrap">
+  <div class="grid" id="grid"></div>
+</div>
+
+<script>
+/* ═══════════ Motor Grid Layout ═══════════
+ *
+ * Physical board (3×5, gap at row0-col2):
+ *   075  071  ---  173  172    row 0
+ *   076  072  070  174  171    row 1
+ *   077  073  176  175  170    row 2
+ *
+ * Motor indices 0-13 match ALL_MOTORS[] in firmware:
+ *   idx 0→075  1→071       2→173  3→172
+ *   idx 4→076  5→072  6→070  7→174  8→171
+ *   idx 9→077 10→073 11→176 12→175 13→170
+ */
+
+// Grid cells: motor index, or -1 for gap
+const GRID = [
+   0,  1, -1,  2,  3,
+   4,  5,  6,  7,  8,
+   9, 10, 11, 12, 13,
+];
+
+// Hardware label for each motor (for display)
+const HW_LABEL = [
+  '075','071','173','172',
+  '076','072','070','174','171',
+  '077','073','176','175','170',
+];
+
+const DEBOUNCE_MS = 80;
+const DEFAULT_RTP = 100;   // 0-127
+
+/* ═══════════ State ═══════════ */
+let port = null, writer = null, connected = false;
+let lastCell = null;
+const lastFire = new Map();
+
+const $ = id => document.getElementById(id);
+const log = msg => $('log').textContent = msg;
+
+/* ═══════════ Build Grid ═══════════ */
+const grid = $('grid');
+const motorCells = new Array(14).fill(null);  // motor index → cell element
+
+GRID.forEach((motor, i) => {
+  const el = document.createElement('div');
+  const isEmpty = motor < 0;
+  el.className = 'cell' + (isEmpty ? ' empty' : '');
+  if (!isEmpty) {
+    el.innerHTML = motor + '<span class="hw">' + HW_LABEL[motor] + '</span>';
+    motorCells[motor] = el;
+  }
+  el.dataset.motor = motor;
+  grid.appendChild(el);
+});
+
+let lastMotor = -1;        // currently active motor index
+
+/* ═══════════ Touch ═══════════ */
+function hitCell(el) {
+  const motor = parseInt(el.dataset.motor);
+  if (motor < 0) return;
+
+  const now = Date.now();
+  if (lastFire.has(motor) && now - lastFire.get(motor) < DEBOUNCE_MS) return;
+  lastFire.set(motor, now);
+
+  // turn off previous motor before firing new one
+  if (lastMotor >= 0 && lastMotor !== motor) {
+    sendCmd('RTP ' + lastMotor + ' 0');
+  }
+
+  // visual
+  if (lastCell && lastCell !== el) lastCell.classList.remove('active');
+  el.classList.remove('active');
+  void el.offsetWidth;
+  el.classList.add('active');
+  lastCell = el;
+  lastMotor = motor;
+
+  sendCmd('HIT ' + motor);
+}
+
+function cellAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  return (el && el.dataset && el.dataset.motor !== undefined && el.dataset.motor !== '-1') ? el : null;
+}
+
+let pressing = false;
+
+grid.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  pressing = true;
+  grid.setPointerCapture(e.pointerId);
+  const el = cellAt(e.clientX, e.clientY);
+  if (el) hitCell(el);
+});
+
+grid.addEventListener('pointermove', e => {
+  if (!pressing) return;
+  e.preventDefault();
+  const el = cellAt(e.clientX, e.clientY);
+  if (el && el !== lastCell) hitCell(el);
+});
+
+const release = () => {
+  pressing = false;
+  if (lastCell) { lastCell.classList.remove('active'); lastCell = null; }
+  // stop all motors when finger lifts
+  if (lastMotor >= 0) {
+    sendCmd('ALLOFF');
+    lastMotor = -1;
+  }
+};
+grid.addEventListener('pointerup', release);
+grid.addEventListener('pointercancel', release);
+
+/* ═══════════ Serial ═══════════ */
+async function sendCmd(cmd) {
+  if (!writer) return;
+  try {
+    await writer.write(new TextEncoder().encode(cmd + '\n'));
+    log('>> ' + cmd);
+  } catch {
+    onDisconnect();
+  }
+}
+
+/* ═══════════ Visualization ═══════════ */
+function applyMotorState(values) {
+  for (let i = 0; i < 14 && i < values.length; i++) {
+    const cell = motorCells[i];
+    if (!cell) continue;
+    const rtp = values[i];
+    if (rtp > 0) {
+      const t = rtp / 127;  // 0..1
+      const r = Math.round(30 + 203 * t);   // 30→233
+      const g = Math.round(58 - 30 * t);     // 58→28
+      const b = Math.round(95 - 0 * t);      // 95→95
+      cell.style.background = `rgb(${r},${g},${b})`;
+      cell.style.boxShadow = `0 0 ${8 + 20 * t}px ${2 + 4 * t}px rgba(233,69,96,${0.2 + 0.5 * t})`;
+      cell.classList.add('vis');
+    } else {
+      cell.style.background = '';
+      cell.style.boxShadow = '';
+      cell.classList.remove('vis');
+    }
+  }
+}
+
+let serialBuf = '';
+
+async function readLoop(readable) {
+  const reader = readable.getReader();
+  const dec = new TextDecoder();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      serialBuf += dec.decode(value);
+
+      // process complete lines
+      let nl;
+      while ((nl = serialBuf.indexOf('\n')) >= 0) {
+        const line = serialBuf.substring(0, nl).trim();
+        serialBuf = serialBuf.substring(nl + 1);
+
+        if (line.startsWith('V ')) {
+          // parse: "V 100,0,50,0,..."
+          const vals = line.substring(2).split(',').map(Number);
+          applyMotorState(vals);
+        } else if (line.length > 0 && !line.startsWith('V')) {
+          log('<< ' + line);
+        }
+      }
+    }
+  } catch { /* closed */ }
+  finally { reader.releaseLock(); }
+}
+
+function onDisconnect() {
+  connected = false; writer = null;
+  $('dot').classList.remove('on');
+  $('btnConnect').textContent = '连接串口';
+  log('已断开');
+  try { port.close(); } catch {}
+  port = null;
+}
+
+$('btnConnect').addEventListener('click', async () => {
+  if (connected) { onDisconnect(); return; }
+
+  if (!('serial' in navigator)) {
+    log('浏览器不支持 Web Serial，请用电脑版 Chrome / Edge');
+    return;
+  }
+
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    connected = true;
+    $('dot').classList.add('on');
+    $('btnConnect').textContent = '断开';
+    log('已连接');
+    readLoop(port.readable);
+  } catch (e) {
+    log('连接失败: ' + e.message);
+    port = null;
+  }
+});
+</script>
+</body>
+</html>
